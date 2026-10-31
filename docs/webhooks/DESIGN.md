@@ -1,93 +1,68 @@
 # Outbound webhook subscriptions
 
-## Status: Design (rev 3)
+## Status: Design (rev 4)
 
 This document is the design proposal for the outbound webhook feature
 discussed in Platform-Collective/platform discussion #236 and issue #33.
 No code lives on `feature/webhooks-design`; this doc is the whole PR.
 
-The feature lets a workspace Owner subscribe an outbound HTTP endpoint to
-Tx events in the workspace. When a matching Tx is applied, a signed POST
-(or PUT) goes to the endpoint. Method, URL, headers and body are all
+The feature lets a workspace Owner subscribe an outbound HTTP endpoint
+to Tx events in the workspace. Method, URL, headers and body are all
 templated; named secrets go through a dedicated `{{ secrets.<name> }}`
 namespace that never renders into logs, previews or audit rows. One
 target kind (`generic`) handles every receiver via templates plus
 built-in presets for `apprise`, `slack`, `discord` and bare `generic`.
-One authorization story (per-attempt Owner + source-read check), one
-SSRF story (DNS-pinned, no redirect, normalized IP literals), one audit
-shape, one durable at-least-once delivery guarantee.
+Authorization is enforced in a plugin-contributed permission middleware
+placed BEFORE storage writes, same slot as `guestPermissions`.
+Destination / filter changes are co-signed by the subscription's
+stored owner, not any current workspace Owner. Secrets live in an
+AEAD-encrypted blob store whose AAD is reconstructed from the
+authenticated context on every decrypt, not read from the stored row.
+A durable outbox is written in the SAME storage transaction as the
+source mutation, with an explicit journal recovery design when a single
+cross-domain transaction is not available. Audit payloads live outside
+ordinary Tx history. Signatures use a formal versioned header grammar
+with repeated headers during key rotation and an immutable per-
+delivery payload. Test events return status + metadata only by
+default; body opt-in is an explicit credential-disclosure
+authorization.
 
 ### Revision history
 
-- **Rev 1** (`7831133506`): first draft. Separate `apprise` target kind;
-  secret stored in the body; `pod-telegram-bot` claimed as the secret
-  storage pattern.
+- **Rev 1** (`7831133506`): first draft. Separate `apprise` target
+  kind; secret stored in the body.
 - **Rev 2** (`cc250b7575`): collapsed `apprise` into a preset of
   `generic`; added named `{{ secrets.<name> }}` namespace with
-  redaction; disabled redirects; HMAC v=2 covered timestamp + delivery
-  id; host-change required secret rebind.
-- **Rev 3** (this revision): rebuilt around MichaelUray's rev-2 review.
-  Secret storage is an authenticated encryption scheme with versioned
-  keys, bound to workspace + subscription + name; `pod-telegram-bot` is
-  NOT the pattern (it uses `BOT_TOKEN` from env). Secret rebind is
-  replaced by a destination + template binding set at creation and
-  re-authorized on every destination change, so the first-save
-  no-baseline gap and the same-host multi-tenant case are both covered.
-  SSRF rebuilt: reject non-public by default, normalize IP literals,
-  validate every A/AAAA + fallback, pin the actual connection, no
-  implicit proxy. Authorization boundary moved: Settings tab is in
-  **workspace** settings not per-user Integrations; every management
-  endpoint, secret write, test, preview and audit read runs through a
-  server-side Owner check. Delivery eligibility is re-verified on every
-  attempt and every retry. `previousStatus` is captured durably at
-  publish time rather than reconstructed from Tx history; `null`
-  explicitly means "reconstruction incomplete." Durable at-least-once
-  outbox between apply and publish; `(subscriptionId, event, txId)` is
-  the full dedup key so `IssueUpdated` and `IssueStatusChange` on one
-  Tx stay distinct. Per-subscription random signing key, replaced on
-  rotation with version coordination. Template content-type parsing
-  normalizes media types; JSON substitution is structural (placeholders
-  only inside strings; validated after render). Secret redaction uses
-  placeholder-first rendering (secrets never substituted into
-  diagnostic output), not substring matching on bytes. `lastFour` is
-  dropped for short secrets. Audit rows are read-gated on current
-  source access; denied deliveries persist identifiers + reason only;
-  request/response storage is opt-in with its own flag. The subscription
-  owner is `AccountUuid` (not `Ref<Account>`); every queue, cache,
-  dedup, lock, secret and limiter key is workspace-qualified. Presets
-  pass the same validation as custom targets; empty optional headers
-  are dropped; Apprise, Slack and Discord presets specify literal paths
-  with separate credential path segments.
+  redaction; disabled redirects; HMAC v=2 covered timestamp +
+  delivery id.
+- **Rev 3** (`c46a6e4d98`): rebuilt around MichaelUray's rev-2
+  review. AEAD secrets with HKDF-derived DEKs; destination binding
+  replacing single-host comparison; per-attempt eligibility re-check;
+  outbox job collection with full dedup key; placeholder-first
+  redaction.
+- **Rev 4** (this revision): addresses MichaelUray's rev-3 review.
+  8 must-fix items and 9 should-clarify items reshape Authorization,
+  Secrets, Delivery, Signing, Audit and Restore. Three new open
+  questions settled with his answers.
 
-## Open questions, resolved
+## Open questions, settled
 
-Three questions were open at the end of rev 2; Michael settled all three
-in his rev-2 review. For the record:
-
-1. **Service naming** → `services/webhooks/pod-webhooks`, matching
-   the existing layout under `services/telegram-bot/pod-telegram-bot`
-   and `services/github/pod-github`.
-2. **Settings location** → a Webhooks entry under **workspace**
-   settings, visible only to workspace Owners. NOT the per-user
-   Integrations category: `Integrations` lives under
-   `setting-account.svelte` and is used for per-user connections
-   (mail, Telegram, GitHub). Workspace-scoped admin surfaces go
-   elsewhere, and reusing a per-user category would have been a
-   privilege-escalation vector.
-3. **Expression language in templates** → **none in v1**. Several
-   narrower subscriptions with `statusFilter` cover the Won/Lost case.
-   A grammar can still be added later without breaking stored
-   subscriptions.
+| # | Question | Answer (from rev-3 review) |
+|---|---|---|
+| 1 | Service naming | `services/webhooks/pod-webhooks` |
+| 2 | Settings tab | Workspace settings > Webhooks, Owner-only |
+| 3 | Expression language | None in v1 |
+| 4 | Second-Owner for destination changes | **Opt-in workspace policy, off by default**. Re-entering every referenced secret stays the default protection; many self-hosted workspaces have a single Owner, so a mandatory second approval would block them. |
+| 5 | `WEBHOOKS_MASTER_KEY` | **Required at service start**. The service refuses to start without it; a one-line key-generation command in the deployment docs keeps the self-hoster path easy. |
+| 6 | `replayHorizonSeconds` | **Default 300 s** (matches Stripe / Slack); subscription-level override allowed for sensitive receivers. |
 
 ## Why outbound
 
 Teams run external integrations today by polling Huly's API from an
-external worker with a long-lived token. Every operator who wants
-cross-system automation runs an extra process, mints that token, and
-keeps a status map in sync with the project's actual status set.
-Hoisting the outbound into the platform removes the external component,
-keeps the subscription set in the same backup as the workspace, and
-lets a non-engineer admin maintain it from workspace settings.
+external worker with a long-lived token. Hoisting the outbound into
+the platform removes the external component, keeps the subscription
+set in the same backup as the workspace, and lets a non-engineer admin
+maintain it from workspace settings.
 
 ## Scope
 
@@ -95,102 +70,97 @@ In scope for v1:
 
 - Issue events only: `IssueCreated`, `IssueUpdated`, `IssueStatusChange`.
 - Workspace Owner-managed subscriptions, per-workspace.
-- Project and status filters per subscription.
+- Project and status filters per subscription (explicit project OR
+  explicit all-projects marker).
 - One target kind `generic` (templated method / URL / headers / body)
   with built-in presets for `apprise`, `slack`, `discord` and bare
   `generic`.
-- Named, write-only secrets stored encrypted at rest with authenticated
-  encryption and versioned keys. Secrets bound to workspace +
-  subscription + name.
+- Named, write-only secrets with authenticated encryption; AAD
+  reconstructed from authenticated context on every decrypt.
 - SSRF protection: public-only by default; IP-literal normalization;
-  every A/AAAA record validated per attempt; connection pinned to the
-  validated IP while preserving hostname TLS verification; no implicit
-  proxy; redirects disabled.
-- HMAC-SHA256 over `v=2;t=<ts>;id=<deliveryId>.<bodyBytes>`, signed
-  with a per-subscription random key, signed per-attempt.
-- Delivery outside the transactor hot path: a Kafka-group consumer with
-  a durable outbox-style job table, exponential backoff with jitter,
-  per-attempt eligibility re-check, and quarantine for poison messages.
-- Per-subscription audit history with current-source-access gating on
-  reads; a Send-test-event action.
+  every A/AAAA validated per attempt; connection pinned to the
+  validated IP; proxy transport pinned to that IP as well; no
+  implicit proxy; redirects disabled.
+- Signatures use a versioned grammar with repeated headers during
+  key rotation; payload is immutable per `deliveryId`.
+- Delivery outside the transactor hot path: a Kafka-group consumer
+  that acknowledges after durable outbox handoff (NOT after terminal
+  HTTP), subscription-wide ordered leases over the outbox, bounded
+  retry + quarantine, backlog + fan-out quotas.
+- Audit payloads live outside ordinary Tx history (dedicated encrypted
+  blob store); audit reads require current source access.
+- Restore ALWAYS pauses subscriptions, regardless of UUID or key
+  recovery.
+- Per-subscription audit history and a Send-test-event action; test
+  returns status + approved metadata only by default.
 
-Explicitly out of v1 (see "Scope exclusions and follow-ups"):
-
-- Doc and Membership events.
-- Per-user personal webhook subscriptions.
-- Fan-out across workspaces.
-- Expression language in templates.
-- Inbound HTTP (that is thomas-bouvier's #33 work).
+Explicitly out of v1: Doc + Membership events, per-user personal
+subscriptions, cross-workspace fan-out, expression language, inbound
+HTTP (#33).
 
 ## Coordination with #33 (inbound) and #238 (workflow-rules)
 
 Three parallel features touch "events across the Huly boundary":
 
-- **This feature (outbound)** - Huly to external, Tx stream to signed POST.
-- **#33 (inbound)** - external to Huly, HTTP post into a Huly channel.
-  Draft at thomas-bouvier/platform:feat/webhook. Separate direction,
-  separate service.
-- **#238 (workflow-rules)** - project-to-project status mirror inside
-  one workspace. Server trigger, no external HTTP. In review.
+- **Outbound (this)** — Huly to external.
+- **#33 (inbound)** — external to Huly. Draft at
+  thomas-bouvier/platform:feat/webhook.
+- **#238 (workflow-rules)** — project-to-project status mirror,
+  internal only. In review.
 
-Shared conventions:
+Shared conventions (open to counter-proposal from @thomas-bouvier):
 
-| Concern | Proposal |
+| Concern | Convention |
 |---|---|
-| Service layout | `services/webhooks/pod-webhooks` (outbound) and the inbound analogue; separate deployables; no runtime cross-dependency. |
-| Secret storage | The authenticated-encryption scheme in [Secrets](#secrets); shared by both services. |
-| UI home | Workspace settings with a Webhooks entry (outbound) and whatever home the inbound side picks; both admin-only, not per-user Integrations. |
-| Rate limits | Sliding window keyed on `(workspace, subscriptionId)` for outbound; `(workspace, tokenId, channel)` for inbound. Shared config keys. |
-| Audit | Each service writes its own `*DeliveryAttempt` collection with the same read-gate semantics; one UI component reads both. |
-| Permission to manage | Workspace Owner for both. Opt-in via Settings > Configure like #238 ships. |
+| Service layout | `services/<feature>/pod-<feature>` for both; no runtime cross-dependency. |
+| Secret storage | The AEAD scheme in [Secrets](#secrets); shared by both. |
+| UI home | Workspace settings; admin-only; NOT the per-user Integrations category. |
+| Rate limits | Sliding window keyed on `(workspace, subscriptionId)` for outbound; analogous for inbound. |
+| Audit storage | Dedicated encrypted blob store, outside ordinary Tx history. |
+| Permission to manage | Workspace Owner for both; opt-in via Settings > Configure like #238. |
 
 ## Shape of a subscription
 
 ```ts
 interface WebhookSubscription extends Doc {
-  // Workspace-scoped. Not project-scoped; filters restrict which
-  // projects it fires on. `Doc.space` is `Ref<Space>` by Platform's
-  // typing; the subscription's space is the workspace's dedicated
-  // settings space. The subscription routes by WorkspaceUuid taken
-  // from the authenticated connection context, never from doc fields.
+  // Workspace-scoped. Doc.space is Ref<Space> per Platform's typing;
+  // the subscription's space is the workspace's dedicated settings
+  // space. The service NEVER routes by this field; routing is by
+  // authenticated WorkspaceUuid in the service context.
   space: Ref<Space>
 
-  // Human label shown in the Settings list.
   name: string
 
-  // Owner is the Account UUID (not a Doc ref). The delivery service
-  // re-reads the source doc under this account's permissions on every
-  // attempt and every retry. Immutable after create.
+  // The account whose source-read permissions gate every delivery
+  // and every management action that targets this subscription.
+  // AccountUuid (not Ref<Account>; Account is UUID-based, not a Doc).
+  // Immutable after create.
   owner: AccountUuid
 
-  // Target config: templated method/URL/headers/body. See "Target".
+  // Target config (templated method/URL/headers/body + binding).
   target: WebhookTarget
 
-  // Monotonic version of the subscription's destination + template +
-  // referenced-secret set. Incremented on every change that touches
-  // any of those. Jobs carry this version at enqueue time; delivery
-  // refuses a job whose version is older than the current one, which
-  // closes the "someone edited the URL between enqueue and attempt"
-  // window.
+  // Monotonic revision. Incremented by the service on every
+  // destination-changing save. Client Tx attempts to set this are
+  // rejected by the permission middleware.
   revision: number
 
-  // Metadata about named secrets. Values live in the TWebhookSecret
-  // collection; this field only lists names and rotation times. No
-  // "lastFour" field: a secret of four characters or fewer would be
-  // fully leaked.
+  // Named-secret metadata. No `lastFour`: a short secret would
+  // leak fully. Only name + rotation time are exposed.
   secretsMeta: Array<{ name: string, lastRotatedAt: Timestamp }>
 
-  // What fires this subscription.
   triggers: WebhookTrigger[]
 
-  // Delivery policy.
   retryPolicy?: WebhookRetryPolicy
 
-  // Soft-off switch. Row stays for audit when paused. Delivery service
-  // re-checks on every attempt (see Delivery eligibility).
+  // Soft-off switch. Re-checked on every attempt.
   enabled: boolean
 
-  // Observability. Updated on every delivery attempt by the service.
+  // Opt-in: receiver response body stored in audit (default false).
+  // Reset to false on every destination-changing save.
+  storeResponseBody: boolean
+
+  // Observability. Service-maintained; immutable from clients.
   lastDeliveryAt?: Timestamp
   lastDeliveryStatus?: 'ok' | 'error' | 'skipped'
   lastDeliveryHttpCode?: number
@@ -198,69 +168,34 @@ interface WebhookSubscription extends Doc {
 }
 
 interface WebhookTarget {
-  // Optional preset. When set, the subscription inherits the preset's
-  // method / headers / body templates at pick time; the stored doc
-  // keeps the fully resolved templates so a preset upgrade in a later
-  // release does not silently change a live subscription.
   preset?: 'apprise' | 'slack' | 'discord' | 'generic'
-
-  method: 'POST' | 'PUT'       // default POST
-
-  // URL template. The scheme and host MUST be literal (parsed at save
-  // time; a template with any placeholder before the first `/` after
-  // scheme is rejected). Placeholders are only allowed in path,
-  // query, and fragment, and are URL-component-encoded on render.
+  method: 'POST' | 'PUT'
   urlTemplate: string
-
-  // Header templates. Reserved names and CR/LF/NUL in rendered values
-  // are rejected at save and on every render. See "Headers".
   headerTemplates: Array<{ name: string, valueTemplate: string }>
-
-  // Request body. See "Body templates". `useMinimalBody: true` sends
-  // the minimal JSON shape with no template at all.
   bodyTemplate?: string
   useMinimalBody?: boolean
-  contentType?: string         // default 'application/json'
+  contentType?: string
 
-  // Destination binding. Captured at create and on every save that
-  // changes URL/method/headers/body or the referenced-secret set.
-  // Delivery compares the stored binding to the final rendered values
-  // on every attempt; a divergence refuses the attempt as
-  // `errorReason: 'bindingDrift'`. Replaces the rev-2 "lastDeliveredHost"
-  // (which had no baseline on first save and did not cover shared-host
-  // multi-tenant endpoints).
-  binding: {
-    scheme: 'https' | 'http'
-    host: string              // literal from the template
-    port: number | null       // literal from the template
-    pathPrefix: string        // literal prefix up to the first placeholder
-    bodyHash: string          // sha256 of the normalized body template
-    headersHash: string       // sha256 of normalized header templates
-    secretNames: string[]     // names referenced by this binding; must
-                              // match secretsMeta exactly for delivery
-    boundAt: Timestamp
-  }
+  // Configuration digest, computed over APPROVED CONFIG (the
+  // templates, method, content type, URL template, header names and
+  // value templates, body template, and the sorted list of secret
+  // names each template references). NOT over rendered values.
+  // See "Binding".
+  configDigest: string
+  configDigestAlg: 'sha256'
+  boundAt: Timestamp
 }
 
 interface WebhookTrigger {
   event: 'IssueCreated' | 'IssueUpdated' | 'IssueStatusChange'
 
-  // Either a specific project OR the explicit all-projects marker.
-  // v1 rejects an omitted scope at save time; the Owner has to opt in
-  // to "every project in the workspace" because a shared TaskType
-  // means a status-only filter does not isolate one project.
+  // Explicit project selection OR explicit all-projects marker.
+  // Rev 3 made this explicit; rev 4 keeps it.
   projectScope: { kind: 'project', projectId: Ref<Project> }
                 | { kind: 'allProjects' }
 
-  // For IssueStatusChange only. Explicit which side the filter
-  // matches, since the issue carries both the prior and the new
-  // status at delivery time.
   statusFilter?: {
     on: 'previous' | 'new'
-    // Status refs are per-TaskType. The UI resolves these at pick
-    // time against the chosen project's TaskType; "allProjects"
-    // scope + status filter is rejected at save because the refs
-    // can't be resolved consistently across TaskTypes.
     statuses: Ref<IssueStatus>[]
   }
 }
@@ -268,27 +203,252 @@ interface WebhookTrigger {
 interface WebhookRetryPolicy {
   maxRetries: number           // default 5
   initialBackoffMs: number     // default 2000
-  backoffFactor: number        // default 2 (exponential)
+  backoffFactor: number        // default 2
   jitterMs: number             // default 500
   timeoutMs: number            // default 10000 (hard-capped at 30000)
+
+  // Per-subscription override of the global replay horizon advertised
+  // to receivers. Default 300 s (set globally); a subscription with
+  // a sensitive receiver can lower this; a subscription cannot raise
+  // it past a service-wide ceiling.
+  replayHorizonSeconds?: number
 }
 ```
 
-The subscription doc lives in the workspace's dedicated settings space;
-the delivery service never trusts the doc's `space` field for routing.
-Every secret, queue, cache, dedup and lock key is prefixed with the
-`WorkspaceUuid` taken from the authenticated service context, so two
-workspaces restored from the same backup do not collide.
+## Authorization
+
+### Placement (fixing MichaelUray's point #1)
+
+Rev 3 proposed a trigger. Rev 4 contributes a plugin **permission
+middleware** that runs BEFORE storage writes, same slot as
+`guestPermissions` in `foundations/server/packages/middleware/`.
+Rationale: `TriggersMiddleware.tx` calls `provideTx` BEFORE
+`processDerived`, and trigger exceptions are caught, so a direct
+`TxUpdateDoc` from a non-Owner lands in storage even if a trigger
+would have rejected it. A permission middleware refuses the Tx before
+`provideTx` and nothing is persisted.
+
+The middleware's intercept list:
+
+- **Create / update / remove `TWebhookSubscription`**: requires
+  current `AccountRole.Owner` on the workspace of the targeted doc.
+  Compound transactions (TxApplyIf, TxCreateDoc wrapping other CUD
+  via `collection`) are walked recursively so a non-Owner cannot
+  smuggle a subscription edit through a collection write.
+- **Changes to the subscription's `owner` field**: rejected
+  unconditionally. `owner` is set at create and never mutated.
+- **Changes to `revision`, `target.configDigest`, `target.boundAt`,
+  `lastDelivery*`, `secretsMeta`**: rejected from any client Tx;
+  service-maintained only.
+- **Destination-changing fields** (`target.method`, `target.urlTemplate`,
+  `target.headerTemplates`, `target.bodyTemplate`,
+  `target.useMinimalBody`, `target.contentType`): must come from the
+  **stored owner** of the subscription OR carry a second-Owner
+  authorization token when the workspace policy requires it. See
+  "Owner-authorized destination changes" below. Fixes point #3.
+- **Create / update / remove of `TWebhookSecret`**: rejected from
+  any direct client Tx. The service's management RPC is the only
+  write path (see [Secrets](#secrets)).
+- **Query `TWebhookDeliveryAttempt`**: filtered by the middleware
+  so a caller sees only rows whose referenced source doc the caller
+  can currently read AND whose subscription owner is still eligible.
+  Rows that fail either check surface as `{reason, count}` buckets,
+  no identifiers. Fixes point #4.
+
+The middleware is unit-tested with the same shape as
+`guestPermissions`.
+
+### Owner-authorized destination changes (fixing point #3)
+
+Rev 3 required re-entering secrets on destination changes but did not
+pin which Owner could authorize the change. A second workspace Owner
+without source access to the subscription's source project could
+redirect that subscription's delivery to their own receiver.
+
+Rev 4 pins destination-changing saves to the subscription's **stored
+owner**:
+
+- The management RPC accepts a destination-changing save ONLY when
+  the authenticated caller is the subscription's stored `owner`.
+  Any current Owner can disable or delete a subscription (that is
+  containment, not configuration), but only the stored owner can
+  modify its destination/filter/body/secrets.
+- A workspace that wants a second-Owner co-sign enables the
+  `requireSecondOwnerForDestinationChanges` policy (opt-in; off by
+  default per rev-3 open question #4). With the policy on, a
+  destination-changing save must carry a short-lived authorization
+  token issued by a different current Owner for that exact
+  `(subscriptionId, proposedRevision, proposedConfigDigest)` triple.
+- A stored owner who loses workspace membership can no longer save
+  a destination change; the management RPC refuses with
+  `errorReason: 'ownerIneligible'`. Enable/disable/delete still
+  work for current Owners because they do not require source
+  access.
+
+Transferring ownership is a one-time management action gated on
+BOTH the current stored owner AND the target account being a
+current workspace Owner.
+
+### Delivery eligibility (per attempt and per retry)
+
+Right before every outbound HTTP call, including every retry and
+every test event, the delivery service re-checks:
+
+- Plugin is enabled in Settings > Configure (`PluginConfiguration.enabled === true`).
+- Subscription doc still exists AND `enabled === true`.
+- Subscription owner is still a workspace member AND still holds
+  `AccountRole.Owner`.
+- Subscription owner currently has read access to the source doc.
+- Target project exists, is not archived, is not restricted.
+- Job's `revision` and `configDigest` both match the subscription's
+  current values (binding guard; see [Binding](#binding)).
+- Rendered destination passes SSRF checks (independent from the
+  configDigest, which hashes the approved config, not the rendered
+  values; fixes point #10).
+
+Failures drop the attempt with the matching `errorReason`. The job
+transitions to `failed` for permanent reasons, `pending` with
+exponential backoff for transient ones.
+
+### Tests and previews (fixing point #3)
+
+- A test or preview requires the caller to be the subscription's
+  **stored owner** OR, when `requireSecondOwnerForDestinationChanges`
+  is on, carry a token from a different current Owner.
+- The chosen source doc for the preview must be readable by the
+  caller AND by the stored owner. If either lacks read access, the
+  action is refused with `errorReason: 'previewSourceUnauthorized'`.
+
+## Secrets
+
+Secrets are a separate concept from the subscription body and never
+land in persisted Tx bodies.
+
+### Storage
+
+```ts
+TWebhookSecret extends TDoc {
+  space: Ref<Space>              // workspace settings space
+  subscription: Ref<WebhookSubscription>
+  name: string                   // matches secretsMeta[i].name
+  masterKeyId: string            // which master key wraps this row
+  dekVersion: number             // which HKDF derivation of that master key
+  ciphertext: Buffer             // AES-256-GCM output: encrypted value only
+  nonce: Buffer                  // 96-bit, random per encrypt
+  tag: Buffer                    // 128-bit GCM auth tag
+  lastRotatedAt: Timestamp
+}
+```
+
+**AAD reconstruction (fixing point #6).** The row stores ciphertext,
+nonce, tag, master key id, and DEK version. It does NOT store the
+workspace uuid, subscription id or secret name as "authoritative"
+inputs to decryption. On every decrypt, the AAD is reconstructed as:
+
+```
+aad = authenticatedWorkspaceUuid
+   || requestedSubscriptionId
+   || requestedSecretName
+   || masterKeyId
+   || dekVersion
+```
+
+where `authenticatedWorkspaceUuid` comes from the service's own
+authenticated transactor connection, `requestedSubscriptionId` and
+`requestedSecretName` come from the caller's current request, and
+`masterKeyId` / `dekVersion` come from the row. Copying the whole row
+into a different workspace does not grant decryption because the AAD
+reconstructed from the destination context does not match the AAD the
+original ciphertext was authenticated under. A row in workspace A's
+backup, inserted into workspace B's secret collection, fails AEAD
+authentication at first decrypt and the subscription auto-pauses with
+`secretsUnreadable`.
+
+The row's `space` is still a `Ref<Space>` because `TDoc` requires one;
+space-security still restricts who can even query the collection, but
+decryption no longer depends on any value the row controls.
+
+### Encryption
+
+- **Scheme:** AES-256-GCM with a 96-bit random nonce per encrypt. GCM
+  gives confidentiality and integrity in one primitive and matches
+  the stored auth tag.
+- **Keys:**
+  - **Master keys** are 32-byte values held by the service.
+    Identified by opaque `masterKeyId` strings. The service holds a
+    **key ring**: one `active` master key plus any number of
+    retired/pending-retirement keys. Rotation adds a new `masterKeyId`
+    to the ring and marks it `active`; existing rows keep their old
+    `masterKeyId` until a background re-encrypt rolls them forward.
+    A row encrypted under `masterKeyId: m1` stays readable as long as
+    `m1` is in the ring, even after `m2` becomes `active`.
+    See [Key succession](#key-succession) for the rotation runbook
+    (fixing point #9).
+  - **Workspace DEKs** are HKDF-derived per workspace from the row's
+    master key: `HKDF(masterKey_m1, info = "webhooks-dek-v<N>|<workspaceUuid>")`.
+    `dekVersion` identifies the derivation; a bump is a cheap way to
+    retire a specific DEK without rotating the whole master key.
+- **No plaintext in Tx bodies.** Secret writes go through a dedicated
+  service RPC. The management RPC encrypts in-service and inserts
+  via a service token. Client Tx that CUDs `TWebhookSecret` is
+  refused by the permission middleware (see Authorization).
+- **Service-only decryption.** The web client cannot decrypt and
+  never sees master keys.
+
+### Key succession (fixing point #9)
+
+The service refuses to start without `WEBHOOKS_MASTER_KEY` set.
+Rotation steps:
+
+1. The self-hoster adds `WEBHOOKS_MASTER_KEY_NEXT=<new 32-byte value>`
+   alongside the existing `WEBHOOKS_MASTER_KEY`, both in base64. The
+   service recognizes both: `WEBHOOKS_MASTER_KEY` is in the ring as
+   `m1` (`active`), the new one is loaded as `m2` (`pending`).
+2. Admin triggers a rotation RPC. The service re-encrypts all rows
+   from `m1` to `m2` as a background job, updating `masterKeyId`.
+   The job pauses the subscription whose secrets it is actively
+   re-encrypting (bounded; one subscription at a time).
+3. When the sweep completes, the admin swaps the env vars:
+   `WEBHOOKS_MASTER_KEY=<new value>`, drop `_NEXT`. The service
+   restarts; `m2` becomes `active`, `m1` leaves the ring.
+4. Backups taken during the rotation window have mixed `masterKeyId`
+   values; restoring requires both keys to be in the ring for the
+   restored period. The deployment docs call this out.
+
+The implementation PR ships a `openssl rand -base64 32` snippet in
+the deployment docs for self-hosters.
+
+### Redaction (placeholder-first)
+
+The service renders two parallel templates per attempt:
+
+- **Request template:** real secret values substituted, context-escaped,
+  HMACed, sent on the wire.
+- **Diagnostic template:** `[SECRET:<name>]` substituted in place of
+  each `{{ secrets.<name> }}` BEFORE any URL-component or JSON
+  encoding. Stored in audit and shown in previews.
+
+Rev 2's substring-match-on-rendered-bytes approach would have missed
+URL-encoded forms (`a/b` → `a%2Fb`) and receiver echoes. Rev 3
+switched to placeholder-first for the outgoing side; rev 4 extends
+the same discipline to the INCOMING side: test / preview responses
+are not stored or shown by default (see
+[Send test event](#send-test-event)).
+
+### No `lastFour`
+
+A secret of four characters or fewer would be fully leaked by a
+suffix. `secretsMeta` exposes name + `lastRotatedAt` only.
 
 ## Target
 
-### Default: no template needed
+### Default: minimal body
 
-A subscription that leaves `bodyTemplate` unset and `useMinimalBody:
-true` gets the minimal JSON body described below with no template to
-write. The signed POST plus HMAC header is the simple case.
+A subscription with `useMinimalBody: true` and no `bodyTemplate`
+sends the minimal JSON body with no template to write. Default when
+the user picks the bare `generic` preset without customization.
 
-### Minimal body (default)
+### Minimal body
 
 ```json
 {
@@ -324,293 +484,665 @@ write. The signed POST plus HMAC header is the simple case.
 }
 ```
 
-Issue titles and `actor.displayName` are **potentially sensitive data**
-and are treated that way everywhere downstream: audit rows read-gated on
-current source access, request body stored only when the subscription
-opts in, denied deliveries persist identifiers + reason only.
+Issue title and `actor.displayName` are sensitive data; see
+[Audit](#audit).
 
 ### Where `previousStatus` comes from
 
-`TxUpdateDoc<Issue>` carries `operations.status` (the new value) but no
-pre-image; the Kafka publication adds metadata but not prior values.
-Rev 2 proposed reconstructing from Tx history; Michael correctly caught
-that a create-in-A-then-update-to-B pattern yields `null` from an
-updates-only search, and a later B→C read-and-reconstruct can misreport
-A→B.
-
-Rev 3 captures the prior status **durably at publish time**:
-
-- When the trigger middleware applies an `TxUpdateDoc<Issue>` that
-  changes `status`, it reads the issue's current status BEFORE applying
-  the Tx and attaches it to the outbox job for that Tx. For
-  `TxCreateDoc<Issue>` the previous status is explicitly `null`
-  (creation case).
-- The outbox entry (see [Durable at-least-once outbox](#durable-at-least-once-outbox))
-  carries `{txId, event, previousStatusRef, newStatusRef, ...}`;
-  publication is atomic with the outbox write.
-- The delivery service builds the payload from the captured values; it
-  never re-reconstructs from Tx history for `previousStatus`.
-- If an outbox entry is missing the prior value for any reason (schema
-  migration, pre-rollout history), `previousStatus` is `null` and the
-  audit row logs `templateWarnings: ['previousStatusUnknown']`.
-  Receivers can rely on `null` meaning "unknown", not "unchanged".
+See [Durable outbox](#durable-outbox-fixing-point-2). The pre-image
+is captured inside the same storage transaction as the source
+mutation; a crash before capture produces no outbox row and no event.
+`null` means "unknown" (schema migration, pre-rollout history), not
+"unchanged".
 
 ### Templates and variables
 
-A template is a UTF-8 string with `{{ ... }}` placeholders. The variable
-set is fixed:
+Variable set (fixed, documented, filled under the owner's current
+permissions):
 
 | Variable | Value |
 |---|---|
 | `{{ event }}` | `IssueCreated` / `IssueUpdated` / `IssueStatusChange` |
 | `{{ txId }}` | triggering Tx id |
 | `{{ deliveryId }}` | delivery uuid |
-| `{{ timestamp }}` | milliseconds since epoch |
-| `{{ timestampIso }}` | ISO-8601 UTC string |
+| `{{ timestamp }}` | ms since epoch |
+| `{{ timestampIso }}` | ISO-8601 UTC |
 | `{{ workspace.uuid }}`, `{{ workspace.name }}` | workspace facts |
 | `{{ project.id }}`, `{{ project.identifier }}`, `{{ project.name }}` | project facts |
 | `{{ issue.id }}`, `{{ issue.identifier }}`, `{{ issue.title }}`, `{{ issue.url }}` | issue facts |
 | `{{ actor.accountUuid }}`, `{{ actor.displayName }}` | the Tx author |
 | `{{ previousStatus.id }}`, `{{ previousStatus.name }}`, `{{ previousStatus.categoryRef }}`, `{{ previousStatus.categoryName }}` | prior status |
 | `{{ newStatus.id }}`, `{{ newStatus.name }}`, `{{ newStatus.categoryRef }}`, `{{ newStatus.categoryName }}` | new status |
-| `{{ secrets.<name> }}` | a named secret, see [Secrets](#secrets) |
+| `{{ secrets.<name> }}` | named secret |
 
-Rules (v1, non-negotiable):
+Rules (v1):
 
-- **Placeholders are literal.** Missing variable renders as the empty
-  string and writes a `templateMiss` warning on the audit row.
-- **No conditionals, loops, expressions, or nested placeholders.** The
-  evaluator is a single pass over known names; anything a `{{ ... }}`
-  points at that is not in the table fails closed (empty + warn).
-- **Escaping is context-aware** and chosen at render time by media
-  type / field:
-  - **URL template:** values are URL-component-encoded
-    (`encodeURIComponent` semantics). Secrets are URL-encoded like any
-    other value.
-  - **Header values:** values inserted raw. CR / LF / NUL in the
-    rendered value is a hard reject with `errorReason:
-    'headerInjection'` (checked both at save on the template and at
-    render on the final value).
-  - **JSON body (content type matched after media-type normalization,
-    see below):** JSON substitution is **structural**, not textual.
-    Placeholders are only allowed inside JSON string literals in the
-    template; a placeholder outside a string (e.g. where a value is
-    unquoted) is rejected at save. On render the value is JSON-escaped
-    inside its string literal. After render the full body is parsed
-    once as JSON; a parse failure is `errorReason: 'templateError'`
-    and the request is not sent.
-  - **Any other content type:** values inserted raw. The author owns
-    escaping; the audit row shows the final rendered body with
-    secrets redacted.
-- **Media type parsing.** `contentType` is normalized by RFC 7231
-  rules: the main type and subtype are extracted (`application/json;
-  charset=utf-8` -> `application/json`), the result is matched
-  case-insensitively, and parameters are preserved on the wire. Only
-  the normalized `application/json` selects structural JSON
-  substitution.
-- **URL host and scheme are literal.** A template with any `{{ ... }}`
-  before the first `/` after scheme is rejected at save. SSRF
-  checks run on the **final rendered URL** post-templating; see
-  [SSRF](#ssrf-protection).
+- Placeholders are literal. Missing variable → empty string +
+  `templateMiss` warning.
+- No conditionals, loops, expressions, nested placeholders.
+- Context-aware escaping:
+  - **URL template**: values URL-component-encoded; secrets URL-encoded.
+  - **Header values**: values inserted raw; CR / LF / NUL in rendered
+    value rejected as `headerInjection`.
+  - **JSON body** (media type normalized per RFC 7231): placeholders
+    only inside JSON string literals in the template; outside-string
+    placeholder rejected at save. After render the body is parsed as
+    JSON; parse failure → `templateError`.
+  - **Other content types**: raw substitution.
+- **URL scheme + host + port MUST be literal** in the template. Any
+  `{{ ... }}` before the first `/` after scheme is rejected at save.
+- Media type parsing: `application/json; charset=utf-8` normalizes to
+  `application/json` for selecting structural substitution; parameters
+  preserved on the wire.
 
-### Secrets
+### Binding (fixing point #10)
 
-Secrets are a separate concept from the subscription body.
+`target.configDigest` is a sha256 over the APPROVED CONFIG (the
+templates, method, content type, URL template, header names and
+value templates, body template, sorted list of referenced secret
+names). It is NOT over rendered values.
 
-**Storage.** The `TWebhookSecret` collection holds one row per
-(subscription, name). Each row carries:
+Delivery compares the job's recorded `configDigest` against the
+subscription's current `configDigest` on every attempt; a mismatch
+is `bindingDrift` and no send happens. `{{ issue.title }}`
+substituting different values does not break binding, because binding
+hashes the TEMPLATE, not the RENDERED output.
 
-```ts
-TWebhookSecret extends TDoc {
-  space: Ref<Space>              // workspace settings space
-  workspaceUuid: WorkspaceUuid   // for key derivation; authoritative
-  subscription: Ref<WebhookSubscription>
-  name: string                   // matches secretsMeta[i].name
-  keyVersion: number             // which workspace key version wraps `ciphertext`
-  ciphertext: Buffer             // AES-256-GCM over (nonce || tag || value)
-  aad: Buffer                    // AEAD associated data; see below
-  nonce: Buffer                  // 96-bit, random per encrypt
-  tag: Buffer                    // 128-bit GCM auth tag
-  lastRotatedAt: Timestamp
-}
-```
+Rendered destination constraints (SSRF, host literal, header
+validity) are separate per-attempt validations that run before send;
+they fail on bad renders without implicating binding.
 
-**Encryption contract.**
-
-- **Scheme:** AES-256-GCM with a 96-bit random nonce per encrypt. GCM
-  gives confidentiality and integrity in one primitive, matching the
-  stored auth tag. No raw AES/ECB, no deterministic encryption, no
-  "encrypt-then-serialize" hand roll.
-- **Key management.** The service holds a per-service master key
-  (`WEBHOOKS_MASTER_KEY`, 32 bytes, provisioned by the self-hoster
-  via a Kubernetes secret / environment variable / HSM wrapper of
-  their choice). Workspace-scoped data encryption keys (DEKs) are
-  derived from the master key via HKDF with info =
-  `"webhooks-dek-v<n>|<workspaceUuid>"`. `keyVersion` on each row
-  identifies the DEK; rotation increments the version and new rows
-  write at the new version while old rows stay decryptable until a
-  background re-encrypt rolls them forward. The master key is never
-  logged, never written to Tx bodies, never carried in queue
-  payloads.
-- **AEAD binding.** `aad` is
-  `workspaceUuid || subscriptionId || secretName || keyVersion`.
-  This binds the ciphertext to its triple so a secret copied between
-  subscriptions, between workspaces, or renamed will fail
-  authentication on read. Prevents cross-tenant and cross-sub
-  substitution attacks.
-- **No plaintext in Tx bodies.** Secret writes go through a dedicated
-  service RPC that encrypts in-service and only writes the ciphertext
-  row. The management API accepts `{secrets: [{name, value}, ...]}`
-  on create / rotate; the response omits the plaintext. There is no
-  path by which a plaintext secret reaches a persisted
-  `TxCreateDoc` / `TxUpdateDoc` body.
-- **Service-only decryption.** The server-side resolver is the only
-  code that holds the master key. The web client cannot decrypt.
-  Previews and test events run on the server, substitute secrets with
-  placeholders (see Redaction), and only the final service-rendered
-  diagnostic (with placeholders left in) comes back to the client.
-- **Recovery and migration.** `WEBHOOKS_MASTER_KEY` is a required env
-  var on service start. The self-hoster backs it up alongside the
-  workspace. Loss of the key means loss of the secrets; the service
-  logs `secretsUnreadable` for affected subscriptions and auto-pauses
-  them. A rotation runbook in the implementation PR covers key
-  succession.
-
-**Deltas from rev 2.** `pod-telegram-bot` is NOT the pattern; it reads
-`BOT_TOKEN` from env ([config.ts][tgconfig]) and does not implement
-authenticated encryption, versioned keys, or per-row binding. Rev 3
-specifies the scheme explicitly.
-
-[tgconfig]: https://github.com/Platform-Collective/platform/blob/5128103d44309f01581a86f54d58210214283180/services/telegram-bot/pod-telegram-bot/src/config.ts
-
-**Redaction (placeholder-first).**
-
-A secret's bytes never participate in diagnostic rendering. The service
-renders two parallel templates per attempt:
-
-- **Request template**: real secret values substituted, then
-  context-escaped, then HMACed, then sent on the wire.
-- **Diagnostic template**: the string `[SECRET:<name>]` substituted in
-  place of each `{{ secrets.<name> }}`, then context-escaped, then
-  stored in audit rows and shown in previews.
-
-This renders `[SECRET:slack_path]` where the real value would have
-been, before any URL-encoding happens. The rev-2 substring-match
-approach would have missed `a%2Fb` from an `a/b` secret; placeholder-
-first makes the leak path shorter and correct by construction.
-
-Audit rows persist only the diagnostic rendering. Receiver response
-bodies are **not stored by default** (opt-in `storeResponseBody: true`
-on the subscription), because a receiver can echo transformed values
-of the secret back in its response and defeat any sender-side
-redactor.
-
-**No lastFour.** A secret of four characters or fewer is fully leaked
-by `lastFour`. Rev 3 shows only `lastRotatedAt` and the name; the UI
-hints "stored, write-only" instead of showing bytes.
-
-### Destination binding (replaces rev-2 "secret rebind on host change")
-
-Rev 2 compared the rendered URL host to `lastDeliveredHost`, which
-provided no baseline before the first successful delivery and
-unconditionally trusted matching hosts (missing the shared-host
-multi-tenant case). Rev 3 captures a destination binding at creation
-and on every destination-changing save:
-
-```ts
-binding: {
-  scheme, host, port, pathPrefix,
-  bodyHash, headersHash, secretNames,
-  boundAt
-}
-```
-
-Every save that touches `method`, `urlTemplate`, `headerTemplates`,
-`bodyTemplate`, `contentType` or the referenced secret set
-**re-captures** the binding and increments `revision`. Every delivery
-attempt computes the final rendered binding from the current
-subscription doc and compares it to the stored `target.binding`; a
-mismatch fails the attempt with `errorReason: 'bindingDrift'` without
-sending anything.
-
-Changes classed as "destination-changing" require the editor to
-**re-enter every referenced secret** in the same session, OR require
-Owner authorization from a second Owner (configurable; defaults to
-single-Owner-plus-reenter), under the "replacement values or
-authorization from someone entitled to supply them for destination or
-secret-placement changes" rule.
-
-The binding also covers **where secrets land**: a save that keeps the
-URL and body but moves `{{ secrets.slack_path }}` from the URL to a
-header counts as a secret-placement change and triggers the same
-re-enter / re-authorize flow. The `secretNames` list in the binding
-is derived from parsing the templates, not from the user's declaration.
-
-### Reserved and generated headers
+### Reserved and generated headers (fixing point #16)
 
 Reserved header names (case-insensitive) rejected at save:
 
 - `Host`, `Content-Length`, `Transfer-Encoding`, `Connection`,
   `Keep-Alive`, `Proxy-*`, `Trailer`, `TE`, `Upgrade`
-- Any header name starting with `X-Huly-` (case-insensitive)
+- Any header name starting with `X-Huly-`
+- **Generated names**: `Content-Type` and `User-Agent` (new in rev
+  4; rev 3 let the user set `Content-Type` and the service appended
+  its own, which allowed a mismatched header pair). The user picks
+  a content type via the `target.contentType` field; the service
+  owns the `Content-Type` header value exactly once.
 
-Also rejected: duplicate header names (two entries that normalize to
-the same lower-case name).
+Also rejected: duplicate header names at save; duplicate rendered
+header names at render; empty-value rendered headers (dropped, with
+`omittedHeaders` recorded in audit).
 
-The service always appends on top of the user's headers:
+Full final header set (user + generated) is validated for uniqueness
+and valid names/values before send.
 
-- `Content-Type: <normalized media type>`
-- `X-Huly-Signature: v=2;t=<ms>;id=<deliveryId>;s=<hex>`
-  where `hex = HMAC_SHA256(signingKey, "v=2;t=<ms>;id=<deliveryId>." + bodyBytes)`
+### Service-generated headers
+
+The service always emits exactly these, in addition to validated user
+headers:
+
+- `Content-Type: <normalized content type>`
+- `User-Agent: huly-webhooks/<serviceVersion>`
 - `X-Huly-Event: <event>`
-- `X-Huly-Delivery: <uuid>` (idempotency key for the receiver)
-- `X-Huly-Subscription: <subscriptionId>` (for receiver-side routing)
-- `User-Agent: huly-webhooks/<version>`
+- `X-Huly-Delivery: <deliveryId>`
+- `X-Huly-Subscription: <subscriptionId>`
+- `X-Huly-Replay-Window: <replayHorizonSeconds>` — advertises the
+  receiver's required dedup retention window; a receiver that holds
+  `X-Huly-Delivery` for at least this many seconds rejects exact
+  replays. Fixes point #14 (receiver dedup window advertised).
+- One or more `X-Huly-Signature` headers (grammar below).
 
-Signing key:
+## Signatures (fixing points #15, #14)
 
-- **Per-subscription**, generated by the service at create time
-  (32 bytes CSPRNG). Never shared across subscriptions; never shared
-  with the receiver. Receivers verify by holding their own copy they
-  obtained out-of-band when the subscription was created.
-- **Rotation** of the signing key is a separate action from secret
-  rotation; it creates a new `signingKeyVersion` entry and the service
-  signs with the new key going forward. The old key is kept for
-  `signingKeyGracePeriod` (default 10 minutes) during which the
-  service signs with BOTH keys (two `X-Huly-Signature` headers) so a
-  receiver running old-and-new key material can roll forward without
-  dropping deliveries.
-- **Signed per attempt**, not per enqueue. A delayed delivery that
-  sits in the queue past its signature's acceptable age gets a fresh
-  signature with a fresh timestamp when the attempt actually runs.
-- The signed string explicitly covers `t` and `id`; receivers reject
-  replays whose timestamp is more than `replayHorizonSeconds` away
-  (default 300). Receivers that persist `deliveryId` for the replay
-  horizon reject exact replays even inside the window.
-- There is **no** workspace-managed `<pluginId>_hmac` key. Rev 2
-  specified both, and sharing a verification key across subscriptions
-  would let one receiver forge another's signatures.
+### Grammar
 
-## Presets
+Formal grammar for `X-Huly-Signature`:
 
-A preset ships a fully resolved template set. The user picks a preset
-at edit time; the stored subscription keeps the resolved templates so
-a later preset bump does not change a live subscription silently.
+```
+signature-header   = signature-element *( "," OWS signature-element )
+signature-element  = version SP ";" param *( ";" param )
+version            = "v=" DIGIT
+param              = key "=" value
+key                = "t" / "id" / "s" / "kid"
+value              = <ASCII, no CR/LF/,/;>
+```
 
-### `apprise`
+Required params for `v=2`:
 
-Michael flagged that rev-2's `secrets.apprise_base` violated the
-literal-host rule. Rev 3 puts the base in a **plain `url` field** that
-the user types in; only credentials go through secrets. The author is
-free to point at an internal Apprise relay (`WEBHOOK_ALLOWED_HOSTS`
-covers that path).
+- `v=2`
+- `t=<unix-ms timestamp of this attempt>`
+- `id=<deliveryId>`
+- `s=<lowercase-hex HMAC-SHA256>`
+- `kid=<signing key id>` (new in rev 4)
+
+Signed string:
+
+```
+"v=2;t=<ms>;id=<deliveryId>;kid=<keyId>." + <bodyBytes>
+```
+
+The signed string explicitly covers `kid` so a receiver can look up
+the right verifier key.
+
+Receivers MUST accept both the repeated-header form (one
+`X-Huly-Signature` per element) and the combined-header form
+(elements comma-separated in one header). Both parse to the same
+list. The service SHOULD emit the repeated-header form; some proxies
+collapse to the combined form so receivers must handle it.
+
+### Signing key per subscription
+
+- Per-subscription random 32-byte key (CSPRNG). Not shared across
+  subscriptions.
+- Receivers obtain their verifier key out-of-band at subscription
+  creation (shown once in the UI, same reveal-and-store flow as
+  the first secret rotation).
+- Rotation creates a new signing key with a new `kid` and marks the
+  old one `pendingRetirement` for `signingKeyGracePeriod` (default
+  600 s). During the grace window the service emits BOTH signatures
+  under their respective `kid` values, so a receiver running old +
+  new verifier keys does not drop deliveries.
+
+### Replay horizon
+
+- Service advertises `X-Huly-Replay-Window: <seconds>`. Receivers
+  that persist `X-Huly-Delivery` for at least this window reject
+  exact replays within it.
+- Default 300 s; subscription-level override (`replayHorizonSeconds`)
+  for sensitive receivers can only LOWER the horizon (service-wide
+  ceiling bounds the setting).
+
+### Payload immutability per delivery (fixing point #14)
+
+- A `deliveryId` is minted when the outbox row is created, not when
+  the attempt runs.
+- The outbox row stores the FINAL RENDERED REQUEST BYTES (URL,
+  headers, body) alongside the deliveryId. All subsequent attempts
+  for that deliveryId re-use those exact bytes. A re-render on a
+  retry is forbidden.
+- Only the signature header is re-generated per attempt (fresh `t`,
+  same `kid`, same `s` computation over the frozen bytes). The
+  receiver sees a stable payload under a stable deliveryId;
+  signature freshness is purely for replay protection.
+- A worker crash between a successful 2xx and the state write is
+  retried with the same frozen payload; the receiver's dedup
+  (within `X-Huly-Replay-Window`) absorbs the duplicate.
+
+The rendered-request store is a service-local blob in the audit
+blob store (same AEAD scheme as secrets), scoped by workspace +
+`deliveryId`. See [Audit](#audit) for retention.
+
+## SSRF protection
+
+Checks run on the **final rendered URL** (post-templating). Scheme +
+host + port must be literal in the template, so event data cannot
+steer the destination.
+
+### Address and transport policy
+
+- **Public-only by default.** Reject if any resolved address falls in
+  a non-public range. Explicit tables for IPv4 (including `127.0.0.0/8`,
+  `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`,
+  `100.64.0.0/10` CGNAT, `0.0.0.0/8`, `224.0.0.0/4` broadcast,
+  `240.0.0.0/4` reserved, `192.0.0.0/24`, `192.0.2.0/24`,
+  `198.18.0.0/15`, `198.51.100.0/24`, `203.0.113.0/24`) and IPv6
+  (`::1/128`, `fc00::/7`, `fe80::/10`, `::/128`, IPv4-mapped
+  `::ffff:0:0/96` with embedded IPv4 re-checked against the IPv4
+  table, IPv4-compatible `::0.0.0.0/96`, 6to4 `2002::/16`,
+  Teredo `2001::/32`).
+- **IPv4-literal normalization.** `127.1`, `0x7f.0.0.1`, octal
+  forms, and any other `net.isIP` representation are normalized
+  before the range check.
+- **Validate every A/AAAA.** The full RRset is validated per attempt;
+  mixed public + private is rejected.
+- **Connection pinning.** The HTTP client connects to the explicitly
+  validated IP via a custom `lookup` function. TLS hostname
+  verification stays against the subscription URL hostname.
+- **Explicit proxy (fixing point #7).** When `WEBHOOK_EXPLICIT_PROXY`
+  is set, the service does NOT delegate hostname resolution to the
+  proxy. Instead, the service resolves the origin itself under the
+  SSRF rules, then issues an HTTP CONNECT to the proxy targeting
+  `<validated-origin-ip>:<port>` (not the hostname). This stops a
+  proxy from resolving the hostname independently and connecting to
+  a private address. TLS verification happens end-to-end against
+  the origin hostname across the CONNECT tunnel. The proxy host
+  itself is validated under the same SSRF rules at service start.
+  Internal exceptions:
+  - `WEBHOOK_ALLOWED_HOSTS` is a list of
+    `host:port[,host:port...]` entries, matched exactly, bypassing
+    the non-public range check for that host+port pair.
+  - `WEBHOOK_ALLOWED_CIDRS` is a list of CIDR ranges + required
+    port ranges, bypassing the non-public check for destinations
+    inside those ranges. New in rev 4 because
+    `WEBHOOK_ALLOWED_HOSTS` cannot cover a self-hoster who allows
+    an entire internal subnet (e.g. a Docker overlay network).
+- **No implicit proxy.** `HTTP_PROXY` / `HTTPS_PROXY` /
+  `NO_PROXY` / system proxy / PAC are ignored. Only
+  `WEBHOOK_EXPLICIT_PROXY` opts into a proxy.
+- **Redirects disabled.** 3xx is a delivery error (`errorReason:
+  'redirect'`).
+- **HTTPS by default.** `http://` only when
+  `WEBHOOK_ALLOW_HTTP=true` AND the host is in the allowlist.
+- Timeout default 10 s, hard cap 30 s. Response body cap 8 KB.
+
+## Durable outbox (fixing point #2)
+
+Rev 3 proposed writing the outbox row in the same Tx as the apply
+and relied on cross-domain atomicity. Michael pointed out that
+Postgres processes domains separately in the existing
+`foundations/server/packages/postgres/src/storage.ts` so a cross-
+domain batch is not actually atomic.
+
+Rev 4 uses a **journal-based recovery** design:
+
+### Journal
+
+A single `TWebhookJournal` entry is written AT THE END of the Tx
+middleware pipeline for every eligible source Tx:
+
+```ts
+TWebhookJournal extends TDoc {
+  space: Ref<Space>
+  // State machine. 'pending' = captured, outbox rows not yet written.
+  // 'realized' = all outbox rows written. 'failed' = outbox write
+  // failed terminally.
+  state: 'pending' | 'realized' | 'failed'
+  // Full capture of what the outbox needs to realize.
+  sourceTx: {
+    txId: Ref<Tx>
+    event: 'IssueCreated' | 'IssueUpdated' | 'IssueStatusChange'
+    issueRef: Ref<Issue>
+    projectRef: Ref<Project>
+    actorPersonId: PersonId
+    previousStatusRef: Ref<IssueStatus> | null
+    newStatusRef: Ref<IssueStatus> | null
+    txModifiedOn: Timestamp
+  }
+  // Matching subscriptions resolved at capture time.
+  matchedSubscriptions: Array<{ subscriptionId: Ref<WebhookSubscription>, revision: number }>
+  attemptCount: number
+  lastAttemptAt: Timestamp | null
+  createdAt: Timestamp
+}
+```
+
+The journal is in the **same domain** as the subscription docs, so a
+single-domain storage transaction suffices for its write. The pre-
+image (`previousStatusRef`) is captured by reading the issue state
+INSIDE the Tx middleware before `provideTx` is called, matching the
+same slot where a trigger would read it, but WITHOUT relying on a
+cross-domain commit boundary.
+
+### Realization
+
+A worker sweeps `state: 'pending'` journal entries and realizes them
+into outbox rows:
+
+```ts
+TWebhookOutboxJob extends TDoc {
+  space: Ref<Space>
+  subscription: Ref<WebhookSubscription>
+  revision: number                 // frozen at realize time
+  event: WebhookTrigger['event']
+  deliveryId: string               // uuid; minted at realize time
+  journal: Ref<TWebhookJournal>
+  txId: Ref<Tx>
+  frozenRequest: {
+    method: 'POST' | 'PUT'
+    url: string                    // final rendered
+    headers: Array<{ name: string, value: string }>
+    bodyBytes: Buffer
+    bodyBytesHash: string          // sha256; used for audit integrity
+    configDigestAtRealize: string  // for bindingDrift re-check
+    renderedAt: Timestamp
+  }
+  state: 'pending' | 'in_flight' | 'done' | 'failed' | 'quarantined'
+  attempts: number
+  nextAttemptAt: Timestamp | null
+  terminalReason: string | null
+  // Set when a worker claims the subscription-wide lease (not this row).
+  // See "Ordering".
+  claimedUnderLease: string | null
+}
+```
+
+Realization steps for one journal entry:
+
+1. Mark journal `in_realization` with an optimistic lock.
+2. For each matched subscription, resolve the owner's current source
+   access. If revoked, write a `denied` audit row directly (no
+   outbox row) and move on.
+3. Compute the final rendered request bytes (URL / headers / body)
+   under the current secret values. Store those in `frozenRequest`.
+4. Insert the outbox row.
+5. When all outbox rows for the journal entry are inserted, mark the
+   journal `realized`.
+
+A crash during realization leaves the journal `pending` /
+`in_realization`; the sweeper retries after lease expiry. Realization
+is idempotent: a journal entry with partial outbox rows will complete
+on the next sweep (unique index on `(journal, subscription)` prevents
+duplicate outbox rows for the same realization).
+
+A journal entry that fails realization repeatedly (default 5
+attempts over bounded time) is marked `failed` and listed in the
+quarantine UI; it does not block other journal entries.
+
+### Dedup key
+
+`(subscriptionId, event, txId)` is the full dedup key. A single Tx
+firing both `IssueUpdated` and `IssueStatusChange` produces TWO
+outbox rows (distinct `event`), matching rev 3.
+
+### Kafka role (fixing point #11)
+
+Kafka is the **wake-up signal**, not the source of truth. The
+delivery service subscribes to the Tx stream to notice journal
+entries promptly; the sweeper is the authoritative worker and runs
+on an interval regardless of Kafka. **Kafka ack happens after the
+journal write succeeds** — NOT after HTTP terminal — so a slow
+receiver on one subscription cannot stall unrelated workspaces
+sharing a partition.
+
+Subscription-key routing is NOT done through Kafka. Rev 3 implied
+Kafka could route per `(workspaceUuid, subscriptionId)`; it cannot
+on the existing topic. Rev 4 does subscription routing in the outbox
+layer via a subscription-wide lease (see Ordering).
+
+## Ordering, claiming, backlog (fixing points #12, #13)
+
+### Subscription-wide lease
+
+The delivery service claims **a subscription**, not a single row.
+When a worker takes `TWebhookSubscriptionLease` for subscription S,
+it is the only worker that may process outbox rows for S until the
+lease expires. The lease has a short TTL (default 30 s) and the
+worker renews it while actively processing; crash + no renewal =
+lease expires and another worker claims.
+
+Within a lease the worker processes outbox rows for S in strict
+`nextAttemptAt` ascending order. A newer `pending` job in S cannot
+overtake an older job that is between retries unless the older job
+is `quarantined` (which releases the slot explicitly). Fixes point
+#13: no row-level race, no retry overtaking without quarantine.
+
+### Backlog quotas (fixing point #12)
+
+- **Per subscription backlog cap:** `maxOutboxPerSubscription`
+  default 10 000 rows. When exceeded, new realizations for that
+  subscription write a `denied` audit row with
+  `errorReason: 'backlogFull'` and the subscription auto-pauses.
+- **Per workspace backlog cap:** `maxOutboxPerWorkspace` default
+  100 000 rows across all subscriptions. Enforced the same way.
+- **Age cap:** an outbox row older than
+  `maxOutboxAgeSeconds` default 7 days is marked `quarantined`;
+  the admin triages.
+- **Fan-out cap:** a single Tx that matches more than
+  `maxFanoutPerTx` default 50 subscriptions marks the journal
+  `failed:fanoutExceeded`. Prevents a misconfiguration (many
+  subscriptions with `allProjects + no filter`) from exploding a
+  single Tx into unbounded work.
+- **Retry budget:** retries + test events + initial attempts all
+  draw from the same per-subscription + per-workspace sliding-window
+  budgets.
+- **Quarantine retention:** `quarantinedJob` rows are kept for
+  `quarantineRetentionDays` default 7, then auto-deleted; the audit
+  rows for their attempts stay on the normal audit schedule. UI
+  shows them with "triage before auto-delete" countdown.
+
+### Overflow
+
+When any quota triggers:
+
+- The subscription is auto-paused.
+- A UI notice names the quota that fired.
+- The source Tx apply is unaffected (never blocks on webhook
+  delivery backlog).
+- The service rejects new management writes to the subscription
+  until the Owner triages (prevents a dashboard-driven loop re-arming
+  a saturated subscription).
+
+## Audit (fixing point #4)
+
+Audit payloads are **sensitive data by definition** (they carry
+rendered request URLs, headers and bodies; they reference issue
+titles and actor display names). Rev 3 kept them in ordinary Doc
+collections; querying `TWebhookDeliveryAttempt` would get space-
+filtered on `objectSpace` which does NOT reach the referenced
+issue's space. So a user who lost source access could still read
+audit rows that leaked the issue content.
+
+Rev 4 moves sensitive audit content **out of ordinary Tx history**:
+
+### Audit blob store
+
+```ts
+TWebhookAuditBlob extends TDoc {
+  space: Ref<Space>              // workspace settings space
+  subscription: Ref<WebhookSubscription>
+  deliveryId: string
+  attempt: number
+  blobId: string                 // reference into the dedicated store
+  masterKeyId: string
+  dekVersion: number
+  ciphertext: Buffer             // audit JSON encrypted with same AEAD as secrets
+  nonce: Buffer
+  tag: Buffer
+  at: Timestamp
+}
+```
+
+The audit JSON holds the rendered URL (diagnostic form with
+`[SECRET:*]`), header names + diagnostic values, body (if the
+subscription opts in via `storeResponseBody`), HTTP code, response
+headers (if opted in), response body (if opted in, first 2 KB),
+`templateWarnings`, and the error reason.
+
+The blob is written in the subscription's workspace settings space,
+same as the subscription doc, so space-security normally applies. On
+every read, the service additionally verifies the **current reader
+has source access to the referenced issue**, using the issue ref
+captured in the parent `TWebhookDeliveryAttempt` row. A reader without
+source access gets back a `redacted` row that only shows outcome +
+error reason + timestamp — no identifiers, no title, no displayed
+name.
+
+Audit **client broadcasts are suppressed**: the audit blob store is
+flagged as a non-broadcast domain so a workspace with 100 Owners
+does not fan out every delivery event. Clients query the audit UI
+through a dedicated RPC that re-authorizes on each read.
+
+### Attempt metadata row
+
+```ts
+TWebhookDeliveryAttempt extends TDoc {
+  space: Ref<Space>
+  subscription: Ref<WebhookSubscription>
+  deliveryId: string
+  attempt: number
+  event: WebhookTrigger['event'] | 'test' | 'skipped' | 'rotated' | 'bindingChanged'
+  txId: Ref<Tx>
+  issueRef: Ref<Issue>           // for current-source-access gating
+  at: Timestamp
+  outcome: 'ok' | 'error' | 'skipped' | 'denied'
+  httpCode?: number
+  errorReason?: string
+  blobId?: string                // reference to TWebhookAuditBlob when outcome allows one
+  omittedHeaders?: string[]
+}
+```
+
+The row carries identifiers + outcome + error reason. The sensitive
+rendered-content lives in `TWebhookAuditBlob` and is read-gated.
+
+### Retention per layer
+
+- `TWebhookDeliveryAttempt` rows: `attemptRetentionDays` default
+  30.
+- `TWebhookAuditBlob`: same retention as its paired attempt row;
+  cleanup worker removes blob + attempt + Tx history as one unit
+  (see Cleanup).
+- `TWebhookOutboxJob`: `done` or `failed` kept for
+  `outboxRetentionDays` default 7.
+- `TWebhookJournal`: `realized` kept for `journalRetentionDays`
+  default 7; `pending` and `in_realization` are kept until they
+  reach a terminal state regardless of age.
+
+### Cleanup worker (fixing point #17)
+
+The worker records a **durable cleanup intent** before any delete.
+
+```ts
+TWebhookCleanupTask extends TDoc {
+  space: Ref<Space>
+  targets: Array<{ collection: string, docId: Ref<Doc> }>
+  state: 'pending' | 'documentsRemoved' | 'historyPruned' | 'done'
+  attempts: number
+  lastError?: string
+  createdAt: Timestamp
+}
+```
+
+Flow per sweep:
+
+1. Build a batch of expired docs across the four collections
+   (`maxCleanupBatch` default 500).
+2. Write a `TWebhookCleanupTask` with the targets, state `pending`.
+3. Issue `TxRemoveDoc` for each target. On success, mark state
+   `documentsRemoved`.
+4. Issue the low-level history-pruning helper (same shape as
+   existing audit roll-offs; the implementation PR will reference
+   the exact helper by name). On success, mark state
+   `historyPruned`, then `done`.
+5. On failure at any step, retain the task row; the next sweep
+   retries idempotently.
+6. **Orphan reconciliation**: if a cleanup task is `pending` for
+   more than `cleanupStuckThresholdDays` default 7, write a
+   `cleanupStuck` metric and page the operator. The row stays in
+   `pending` until human triage; the worker never auto-abandons.
+
+Confidential history is NOT indefinitely retained if a step partially
+succeeds, because the cleanup task row keeps the pending work
+visible to the next sweep.
+
+### Backups and client broadcasts
+
+- The audit blob domain is excluded from the ordinary client
+  broadcast list; a Tx that writes a `TWebhookAuditBlob` does not
+  push through `broadcast.txes`. Clients read via RPC which
+  re-authorizes.
+- Backups keep original data as before. Restore handling (next
+  section) pauses all subscriptions on restore so the restored
+  audit history is never dispatched or broadcast until an Owner
+  explicitly reactivates.
+
+## Restore and clone (fixing point #8)
+
+Rev 3 relied on cross-workspace decryption failure to pause
+subscriptions on restore. A same-workspace restore that keeps the
+UUID and the master key decrypts fine and would resume production
+sends. Rev 4 pauses **unconditionally** on every restore:
+
+- The restore path (`server/backup/src/restore.ts`) sets a workspace-
+  level flag `webhooksRestoreGuardSet=true` as its last step.
+- On service start AND on every subscription read, the delivery
+  service checks the flag. When set, all subscriptions in the
+  workspace are forced to behave as `enabled: false` for delivery
+  purposes, regardless of the stored field.
+- Any `pending` outbox rows that existed before restore are
+  quarantined with `errorReason: 'restoreGuard'` so they do not
+  fire later.
+- A UI banner shows "Subscriptions paused after restore. Review
+  destinations and credentials before reactivating."
+- The flag clears only when an Owner opens each subscription,
+  confirms destination + credentials, and runs an explicit
+  reactivation action. The reactivation is per-subscription so a
+  workspace with many subscriptions does not have to review all at
+  once; the banner shows a count of still-paused ones.
+- Clone operations (if any) set the same flag.
+
+## UI
+
+Workspace settings > Webhooks tab. Owner-only. Hidden entirely when
+`PluginConfiguration.enabled === false`.
+
+Per subscription row:
+
+- Name, preset badge, URL host (full URL hidden; secrets masked).
+- Enabled toggle (atomic apply).
+- Last delivery: timestamp, status, HTTP code, diagnostic body
+  preview with `[SECRET:*]` (only when `storeResponseBody` is on
+  and the reader has source access to the referenced issue).
+- Actions: Edit (stored owner only), Send test event (stored owner
+  only), Delete (current Owner).
+
+Editor:
+
+- Name
+- Preset selector (apprise / slack / discord / generic)
+- Method, URL template (host literal; URL preview on blur)
+- Header list (reserved + generated names blocked; CR / LF rejected
+  on blur)
+- Content type + body template OR "Use minimal body"
+- Named secrets panel: add / rotate / remove (service RPC;
+  write-only; `lastRotatedAt` shown).
+- Triggers: event + `projectScope` + `statusFilter.on`.
+- Retry policy (collapsed).
+- **Render preview**: picks a recent matching issue the caller can
+  read; renders the diagnostic URL / headers / body with
+  `[SECRET:*]`; shows what will be POSTed. Preview requires caller +
+  stored owner source-access.
+
+### Send test event (fixing point #5)
+
+- Picks a recent matching Issue the caller + stored owner can both
+  read.
+- Builds the payload with real values and sends with the live
+  signed body.
+- **Response display defaults to status + headers metadata only**.
+  Body is NOT shown. A collapsed section says "Receiver returned N
+  bytes; show response body [requires acknowledgement]."
+- Clicking "Show response body" presents an explicit disclosure
+  warning: "The receiver may echo values of your stored
+  credentials in its response. Showing the body may reveal
+  credential bytes to you if the receiver echoed them.
+  Continue?" Only on the second confirmation does the modal fetch
+  and show the body.
+- The response body is not persisted unless
+  `storeResponseBody: true` on the subscription AND the caller
+  acknowledges disclosure at save time.
+- An audit row with `event: 'test'` is written in both cases;
+  only the metadata row is persisted on default-no-body tests.
+
+### Rotation UX
+
+- Rotating a secret: service RPC regenerates; the UI shows the new
+  value once (reveal-and-store flow); audit row `rotated` written.
+  Externally-provisioned credentials (where the receiver issues the
+  new value out-of-band) are a two-step: user pastes new value into
+  the editor, then clicks Rotate; the UI calls that out as "Paste
+  the new value from <receiver>, then rotate." Fixes a rev-3 nit
+  about distinguishing external vs internal rotation.
+- Rotating the subscription's signing key: separate action in the
+  editor; shows the new verifier value once; the grace window is
+  automatic (service emits both signatures until the window
+  expires).
+
+## Apprise and other presets
+
+### `apprise` (fixing point #18 and rev-3 open question)
 
 ```yaml
+preset: apprise
 method: POST
-urlTemplate: "https://apprise.internal.example/notify"   # user supplies, literal
+# User types the Apprise base URL literally; validated as a host.
+# WEBHOOK_ALLOWED_HOSTS / WEBHOOK_ALLOWED_CIDRS covers internal
+# Apprise relays.
+urlTemplate: "https://apprise.example/notify"
 headerTemplates:
+  # Optional. The editor drops this template entirely when
+  # `apprise_bearer` has no stored value, BEFORE the save-time
+  # validation that would otherwise fail on an unresolvable
+  # secret reference.
   - name: Authorization
-    valueTemplate: "Bearer {{ secrets.apprise_bearer }}"   # omitted on render if secret missing
+    valueTemplate: "Bearer {{ secrets.apprise_bearer }}"
+    requiresSecret: 'apprise_bearer'    # new field: ties this header to a secret
 contentType: application/json
 useMinimalBody: false
 bodyTemplate: |
@@ -623,534 +1155,117 @@ bodyTemplate: |
   }
 ```
 
-An empty optional header is **omitted on render** (not sent as
-`Authorization: Bearer `). The behavior is explicit: a header whose
-rendered value is empty after all substitution is dropped from the
-request. Documented in the audit row as `omittedHeaders:
-['Authorization']`.
+A header template may declare `requiresSecret: '<name>'`. The save
+pipeline **drops the whole header** when the named secret has no
+value, THEN runs the "every referenced secret is present"
+validation. An Apprise install without a bearer saves cleanly; the
+rendered request simply omits `Authorization`.
 
 ### `slack` and `discord`
 
-Slack's incoming webhook URL has three path segments; Discord has two.
-Rev 3 splits them so the `/` separator isn't URL-encoded:
+Credentials split into separate path segments so the structural `/`
+is not URL-encoded. Three Slack components or two Discord
+components; each is its own named secret.
 
-```yaml
-# slack
-urlTemplate: "https://hooks.slack.com/services/{{ secrets.slack_t }}/{{ secrets.slack_b }}/{{ secrets.slack_c }}"
-```
+### Preset validation parity
 
-```yaml
-# discord
-urlTemplate: "https://discord.com/api/webhooks/{{ secrets.discord_id }}/{{ secrets.discord_token }}"
-```
-
-The user enters three Slack components or two Discord components when
-creating; each lands in its own named secret. URL-component encoding
-on an opaque token has no effect; splitting the structural `/` out of
-the secret keeps the URL well-formed.
-
-### `generic` (bare)
-
-User writes method / URL / headers / body themselves. Default when the
-user picks "custom".
-
-**All presets go through the same template validation as a custom
-target.** No fast path, no "trusted" preset shape; the save pipeline
-rejects a preset the same way it rejects a hand-written template that
-violates any rule.
-
-## SSRF protection
-
-All checks run on the **final rendered URL** post-templating. The URL
-template requires a literal scheme + host + port, so event data cannot
-steer the destination; see "Templates and variables".
-
-### Address and transport policy
-
-- **Public-only by default.** Reject if any resolved address is in a
-  non-public range:
-  - IPv4: `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10` (CGNAT),
-    `127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`,
-    `192.0.0.0/24`, `192.0.2.0/24`, `192.168.0.0/16`,
-    `198.18.0.0/15`, `198.51.100.0/24`, `203.0.113.0/24`,
-    `224.0.0.0/4`, `240.0.0.0/4`.
-  - IPv6: `::1/128`, `fc00::/7`, `fe80::/10`, `::/128`,
-    IPv4-mapped `::ffff:0:0/96` (expanded and the embedded IPv4 is
-    re-checked against the IPv4 table above), IPv4-compatible
-    `::0.0.0.0/96`, 6to4 `2002::/16` (reserved for the embedded
-    IPv4), teredo `2001::/32`.
-  - IPv4 literals in any form Node's `net.isIP` recognises
-    (`127.1`, `0x7f.0.0.1`, octal) are normalized to dotted-quad
-    before the check.
-- **Validate every A/AAAA.** Resolve to the full RRset; reject if
-  any resolved address falls in a non-public range. A hostname whose
-  record set mixes public and private addresses is still rejected
-  because the connection could race either way.
-- **Pin the connection, not just the resolution.** The HTTP client
-  connects to the explicitly validated IP (passing a custom `lookup`
-  function to Node's `net.createConnection`) rather than letting
-  libc / libresolver run its own lookup during connect. TLS hostname
-  verification stays against the subscription's URL hostname, so an
-  attacker who can race DNS cannot swap in a cert for the
-  destination.
-- **No implicit proxy.** The HTTP client ignores `HTTP_PROXY`,
-  `HTTPS_PROXY`, `NO_PROXY`, system proxy settings, and PAC-file
-  resolution. A self-hoster who needs an explicit outbound proxy
-  provides it via `WEBHOOK_EXPLICIT_PROXY=https://proxy.example:3128`;
-  the service then resolves the proxy's host under the SSRF rules
-  too and uses that one proxy for every request.
-- **Redirects disabled.** 3xx is a delivery error
-  (`errorReason: 'redirect'`); the admin fixes the receiver side.
-- **Protocol whitelist.** `https://` only by default. `http://`
-  accepted only when `WEBHOOK_ALLOW_HTTP=true` AND the host is in
-  `WEBHOOK_ALLOWED_HOSTS`.
-- **Self-hoster host allowlist.** `WEBHOOK_ALLOWED_HOSTS` is a
-  comma-separated list of (host, port) tuples that bypass the
-  non-public range check but still go through connection pinning
-  and TLS verification. Required for self-hosters running an Apprise
-  instance on the same Docker network.
-- **Timeout + response cap.** `timeoutMs` default 10s, hard cap 30s.
-  Response body cap 8KB (read-and-truncate).
-
-### Known limits
-
-- An on-path attacker who controls the DNS server AND the destination
-  AND is MITMing TLS can still substitute addresses; TLS cert pinning
-  per subscription is a future extension if a workspace needs it.
-- IPv6 scope IDs (`fe80::1%eth0`) are rejected outright.
-- IDN hostnames are normalized with `URL`'s own IDNA before the
-  resolver call; display stays Unicode in the audit row.
-
-## Authorization
-
-**Boundary.** The Webhooks settings tab lives under **workspace
-settings**, visible only to workspace Owners. It is NOT in the
-`setting-account` category (which `settings-account.svelte` serves and
-is per-user). Rev 2 proposed Settings > Integrations; rev 3 corrects
-that because Integrations is a user-visible category and would be a
-privilege-escalation vector.
-
-### Server-side enforcement
-
-Every management endpoint, secret write, test action, preview, and
-audit read runs through an **Owner check against the current workspace
-membership**. The check is enforced on the server, in the trigger
-middleware, not just in the UI:
-
-- Creation / edit / enable / disable / delete of `WebhookSubscription`:
-  Owner required.
-- Creation / rotation / deletion of `TWebhookSecret`: Owner required.
-- Test-event action: Owner required AND the owner (as stored on the
-  subscription) must currently have source access.
-- Preview rendering: Owner required AND the caller must currently
-  have source access to the preview's chosen issue. The preview
-  server-side substitutes `[SECRET:<name>]` placeholders so the
-  caller does not need secret-read permission (secrets are
-  service-only decrypt anyway).
-- Audit read: Owner required AND, for each row returned, the current
-  caller must have source access to the referenced doc. Rows the
-  caller cannot access are filtered out; the UI shows "N denied
-  entries" with no identifiers.
-
-Server-side checks:
-
-- `WebhookSubscription.owner` is bound at create and immutable; a Tx
-  that tries to change `owner` is rejected by the trigger middleware.
-- `WebhookSubscription.revision` is service-maintained; a Tx from a
-  client that tries to decrement it or hold it steady while changing
-  a destination-binding field is rejected.
-- `TWebhookSecret` rows are service-written only; no client Tx may
-  create or update the collection. The management RPC writes them.
-
-### Delivery eligibility (per attempt and per retry)
-
-Right before every outbound HTTP call, including every retry and
-every test event, the delivery service re-checks:
-
-- The plugin is still enabled in Settings > Configure
-  (`PluginConfiguration.enabled === true`, same as #238).
-- The subscription doc still exists and is still enabled.
-- The subscription owner is still a workspace member AND still holds
-  the Owner role in the workspace. A demoted owner may still legally
-  read the source issue, but the Owner-managed export policy means a
-  demoted owner cannot fire a webhook they could not create today.
-- The source issue still exists and the subscription owner currently
-  has read access to it. Dropped if revoked.
-- The target project exists and is not archived and (for
-  `TypedSpace`) not restricted.
-- The job's `revision` matches the subscription's current `revision`.
-  A later edit (destination change, re-bind, etc) invalidates
-  in-flight jobs created against the earlier revision.
-- The target `binding` on the current doc matches the computed
-  rendered binding (bindingDrift guard).
-
-Any of those failing drops the attempt with the matching
-`errorReason`. The job is removed from the outbox (unless the failure
-is transient, in which case it stays and retries by backoff).
-
-## Delivery pipeline
-
-### Durable at-least-once outbox
-
-The server applies a Tx and responds to the client before publication
-to the Kafka Tx stream (see
-[`client.ts`][client-apply]), and publication happens during
-[broadcast][broadcast-queue]. A crash in the window between apply
-and publish loses events. Rev 2 implicitly accepted that gap. Rev 3
-closes it with an **outbox**:
-
-[client-apply]: https://github.com/Platform-Collective/platform/blob/5128103d44309f01581a86f54d58210214283180/foundations/server/packages/server/src/client.ts
-[broadcast-queue]: https://github.com/Platform-Collective/platform/blob/5128103d44309f01581a86f54d58210214283180/foundations/server/packages/middleware/src/queue.ts
-
-- The trigger middleware for `WebhookSubscription`-eligible Txes
-  computes the match set INSIDE the transaction that applies the Tx
-  (reads from the current snapshot of subscriptions, triggers,
-  owner, revision, binding) and writes an outbox row per match:
-
-  ```ts
-  TWebhookOutboxJob extends TDoc {
-    space: Ref<Space>
-    workspaceUuid: WorkspaceUuid
-    subscription: Ref<WebhookSubscription>
-    revision: number                 // sub revision at enqueue
-    event: WebhookTrigger['event']
-    txId: Ref<Tx>
-    txModifiedOn: Timestamp
-    previousStatus: StatusSnapshot | null
-    newStatus: StatusSnapshot | null
-    actorPersonId: PersonId
-    issueRef: Ref<Issue>
-    projectRef: Ref<Project>
-    state: 'pending' | 'in_flight' | 'done' | 'failed' | 'quarantined'
-    attempts: number
-    nextAttemptAt: Timestamp | null
-    lockedBy: string | null
-    lockedUntil: Timestamp | null
-    terminalReason: string | null
-  }
-  ```
-
-- The outbox row is written in the same transaction as the Tx apply,
-  so a crash after apply still leaves the job in the outbox for
-  recovery.
-- The delivery service polls the outbox for ready jobs
-  (`state === 'pending'` AND `nextAttemptAt <= now`) with a Kafka
-  consumer group that owns ordered consumption per `(workspaceUuid,
-  subscriptionId)` partition key, ensuring per-receiver order and
-  parallelism across subscriptions.
-- Jobs are claimed with an optimistic lock
-  (`lockedBy, lockedUntil`) and processed one at a time per
-  subscription. A worker crash releases the lock on timeout.
-- `(subscriptionId, event, txId)` is the full dedup key; the outbox
-  has a unique index on it so re-enqueueing an identical event is a
-  no-op. `IssueUpdated` and `IssueStatusChange` on the same Tx are
-  distinct jobs because `event` is in the key (rev 2 would have
-  collapsed them).
-
-### At-least-once contract
-
-- The service guarantees **at-least-once** delivery; receivers must
-  deduplicate on `X-Huly-Delivery`.
-- A crash between a successful HTTP 2xx and the outbox state write
-  can cause one duplicate (worker died before marking `done`); the
-  recovery sweep retries, and the receiver's dedup absorbs it.
-- The outbox row keeps its ID across restarts; terminal states
-  (`done`, `failed`, `quarantined`) are persisted before the service
-  acknowledges Kafka consumption.
-
-### Stages
-
-1. **Apply + outbox write** in the Tx middleware. Status pre-image
-   is read inside the Tx.
-2. **Kafka publication** of the Tx happens as before; the webhooks
-   service also subscribes to the stream, but the stream is the
-   trigger not the source of truth. If Kafka missed a publish, the
-   outbox sweeper picks the job up on its own.
-3. **Claim** a job (optimistic lock, exponential nextAttemptAt).
-4. **Eligibility re-check** (section
-   [Delivery eligibility](#delivery-eligibility-per-attempt-and-per-retry)).
-5. **Render** request + diagnostic templates. Diagnostic is stored.
-6. **Validate binding** against the current subscription doc.
-7. **Sign** per-attempt with fresh timestamp + deliveryId.
-8. **Deliver** via DNS-pinned HTTPS, no redirects.
-9. **Audit** write.
-10. **Mark job state** terminal or scheduled.
-
-### Retries, backoff, and quarantine
-
-- Exponential backoff with full jitter:
-  `delay = min(cap, random(0, initial * (factor ** attempt))) + jitter`.
-- `maxRetries` default 5 → 2s, 4s, 8s, 16s, 32s.
-- `X-Retry-After` from the receiver honored, bounded by `cap`.
-- A **permanent failure** (`bindingDrift`, `ownerLostAccess`,
-  `headerInjection`, `templateError`, `ssrf`, `pluginDisabled`,
-  `subscriptionDisabled`, 4xx with no `Retry-After`) marks the job
-  `failed` immediately without retry.
-- A job that exhausts `maxRetries` with transient errors is marked
-  `quarantined` and sits in a dead-letter list visible in the UI.
-  An Owner can retry or discard it; it does not block other jobs on
-  the same subscription.
-- **Poison-message isolation**: the Kafka consumer uses stream order
-  and per-subscription in-flight limiting, so a deterministic
-  failure on one subscription does not stall unrelated workspaces
-  sharing a partition. The outbox is the authoritative queue for
-  retries; Kafka re-reads only re-check against the outbox.
-
-### Rate limits
-
-- Per subscription: `maxDeliveriesPerMinute` default 30, sliding
-  window.
-- Per workspace: `maxWorkspaceDeliveriesPerMinute` default 300.
-- Test events, retries, and initial attempts all count against the
-  same budgets.
-- If a subscription stays saturated for `saturationWindows` default
-  10 consecutive windows, auto-pause the subscription with
-  `lastDeliveryStatus: 'skipped'` and a notice in the UI. An Owner
-  re-enables manually.
-
-## Audit
-
-```ts
-TWebhookDeliveryAttempt extends TDoc {
-  space: Ref<Space>
-  workspaceUuid: WorkspaceUuid
-  subscription: Ref<WebhookSubscription>
-  event: WebhookTrigger['event'] | 'test' | 'skipped' | 'rotated' | 'bindingChanged'
-  txId: Ref<Tx>
-  deliveryId: string
-  attempt: number
-  at: Timestamp
-  method: 'POST' | 'PUT'
-  renderedUrlDiagnostic: string      // secrets as [SECRET:<name>]
-  renderedHeadersDiagnostic: Array<{ name: string, value: string }>
-  renderedBodyDiagnostic: string     // may be stored only if subscription opts in
-  omittedHeaders: string[]           // empty-value headers dropped on render
-  bodyStored: boolean                // true only if subscription.storeResponseBody
-  httpCode?: number
-  outcome: 'ok' | 'error' | 'skipped'
-  errorReason?:
-    | 'ssrf' | 'ownerLostAccess' | 'ownerDemoted' | 'rateLimit' | 'timeout'
-    | 'nonTwoxx' | 'templateError' | 'headerInjection' | 'redirect'
-    | 'bindingDrift' | 'pluginDisabled' | 'subscriptionDisabled'
-    | 'secretsUnreadable' | 'poisonQuarantined' | 'other'
-  errorMessage?: string              // redacted
-  truncatedResponse?: string         // 8KB cap; stored only if storeResponseBody
-  templateWarnings?: string[]        // e.g. ['missingVariable:actor.email']
-  // Identifiers only (for a 'denied' row):
-  denyMeta?: {
-    reason: 'ownerLostAccess' | 'ownerDemoted' | 'subscriptionDisabled'
-            | 'pluginDisabled'
-    issueRef: Ref<Issue>
-    at: Timestamp
-  }
-}
-```
-
-**Confidentiality controls.**
-
-- **Read-gating.** Reading an audit row requires workspace Owner
-  AND current source access on the referenced doc. The query
-  middleware filters a page of audit rows and reports a count of
-  denied rows separately; the UI shows `N denied entries` without
-  identifiers for those.
-- **Default minimal storage.** Request body and response body are
-  stored only when the subscription opts in via `storeResponseBody:
-  true` on `TWebhookSubscription`. Otherwise the audit row persists
-  identifiers (`txId`, `deliveryId`, `event`), the diagnostic URL
-  with `[SECRET:*]` placeholders, header names (not values), and
-  the outcome.
-- **Denied-delivery rows.** When eligibility fails (owner lost
-  access, demoted, etc) the row writes `denyMeta` with just the
-  identifiers and the reason; no issue title, no actor name, no
-  rendered body. The intent is a count-and-reason surface for the
-  Owner without re-exposing the information the owner lost access
-  to.
-- **Retention per storage layer.** `TWebhookDeliveryAttempt` rows
-  roll off at `attemptRetentionDays` default 30. The underlying
-  Tx bodies for the rows are also pruned by a dedicated cleanup
-  worker (see below) because deleting the Doc does NOT by itself
-  purge the Tx history. Separately, the outbox job rows have their
-  own retention; a `done` or `failed` job keeps for
-  `outboxRetentionDays` default 7.
-- **Cleanup worker.** A daily job on the server:
-  - Reads expired `TWebhookDeliveryAttempt` and `TWebhookOutboxJob`
-    rows, bounded batch size 500, over at most N minutes.
-  - For each, issues a `TxRemoveDoc` AND a direct
-    low-level cleanup of the `TxCreateDoc` / `TxUpdateDoc` bodies
-    for those rows (same shape as other audit roll-offs in the
-    fork; the implementation PR will reference the exact helper).
-  - On failure, writes a `cleanupFailure` metric; on 3 consecutive
-    failures, pages the operator.
-- **Backups.** The implementation PR must call out that backups
-  taken before a roll-off still contain the original data. A
-  restored backup goes through the Restore handling in [UI](#ui)
-  before the delivery service dispatches anything from it.
-
-## UI
-
-Workspace settings > Webhooks tab.
-
-Visible to Owners when the plugin is enabled in Settings > Configure.
-The tab registration (in `models/all/src/index.ts` style) checks
-`AccountRole.Owner` on render; a non-Owner never sees the entry.
-
-Per subscription row: Name, preset badge, URL host (full URL hidden -
-secrets masked). Enabled toggle (atomic apply). Last delivery panel:
-timestamp, status, response code, diagnostic body preview with
-`[SECRET:*]`. Actions: Edit, Send test event, Delete (with confirm).
-
-Editor:
-
-- Name
-- Preset: apprise / slack / discord / generic
-- Method, URL template (host literal; URL preview on blur)
-- Header list (reserved names blocked, CR/LF rejected on blur)
-- Content type + body template OR "Use minimal body"
-- Named secrets panel: add / rotate / remove. Values entered here,
-  never shown back. `lastRotatedAt` for each.
-- Triggers: event + `projectScope` (specific project OR explicit
-  all-projects) + `statusFilter` (previous or new) with
-  TaskType-resolved status picker. "allProjects" + statusFilter is
-  blocked at save.
-- Retry policy, collapsed by default.
-- **Render preview**: picks a recent matching issue the caller can
-  read; renders URL / headers / body with `[SECRET:*]`
-  placeholders; shows the shape that will be POSTed. Preview goes
-  through the exact server-side renderer the delivery path uses.
-
-Save:
-
-- All template validations run server-side.
-- If any destination-binding field changed, the editor requires
-  every referenced secret to be re-entered this session (or a second
-  Owner's authorization, if the workspace policy demands it).
-- `revision` increments on the saved doc.
-
-Send test event:
-
-- Picks the most recent matching Issue in the first project trigger
-  (or an explicit stub if none).
-- Builds the payload with real values.
-- POSTs with the live signed body.
-- Shows the diagnostic (redacted) request preview AND the response
-  (code + first 2KB) in a modal.
-- Writes an audit row with `event: 'test'`. Counts against the rate
-  limit.
-
-**Restore and clone behavior.**
-
-A backup restored into a different workspace (or a dev workspace) can
-contain enabled subscriptions whose endpoints are production
-receivers. Rev 3 handles that explicitly:
-
-- On service start, the delivery service compares the restored
-  workspace's `WorkspaceUuid` against the UUID in the signing key
-  derivation; a mismatch (which happens on cross-workspace restore
-  because the master key's HKDF info includes workspace uuid) means
-  secrets are unreadable, which cascades to `secretsUnreadable` on
-  every subscription and auto-pause.
-- The restore worker (if any) writes a one-time banner in the UI:
-  "Webhook subscriptions were restored. Deliveries are paused.
-  Review destinations and re-enter credentials to re-enable."
-- The implementation PR documents the key succession runbook.
+All presets go through the same validation as custom targets. No
+fast path. A preset that uses an optional-with-`requiresSecret`
+header passes exactly when the equivalent custom target would.
 
 ## Data model summary
 
-Four Docs:
+```ts
+// User-visible subscription doc.
+TWebhookSubscription extends TDoc { ... }
 
-- `TWebhookSubscription` - the user-visible subscription doc.
-- `TWebhookSecret` - one row per (subscription, name), encrypted.
-- `TWebhookOutboxJob` - one row per (subscription, event, txId),
-  the authoritative queue state.
-- `TWebhookDeliveryAttempt` - one row per attempt; audit surface.
+// Journal: pending capture of an eligible source Tx.
+// Lives in the same domain as subscriptions for single-domain
+// atomicity.
+TWebhookJournal extends TDoc { ... }
 
-All four are workspace-scoped and all four roll off on their own
-schedule. The cleanup worker is one process reading from each
-collection in turn.
+// Outbox row per (subscription, event, txId); authoritative queue.
+TWebhookOutboxJob extends TDoc { ... }
+
+// Attempt metadata row: identifiers, outcome, error reason, blob ref.
+TWebhookDeliveryAttempt extends TDoc { ... }
+
+// Encrypted blob holding rendered-request + rendered-response audit
+// payloads. Non-broadcast; AEAD-encrypted; AAD reconstructed from
+// authenticated context.
+TWebhookAuditBlob extends TDoc { ... }
+
+// Named secrets. Service-write only; AEAD-encrypted; AAD
+// reconstructed from authenticated context.
+TWebhookSecret extends TDoc { ... }
+
+// Subscription-wide lease for ordered delivery.
+TWebhookSubscriptionLease extends TDoc { ... }
+
+// Durable cleanup intent; retains confidential history pruning
+// state across worker crashes.
+TWebhookCleanupTask extends TDoc { ... }
+```
+
+All eight are workspace-scoped; all eight route by the service's
+authenticated `WorkspaceUuid`, never by doc fields.
 
 ## Testing
 
 Unit:
 
-- Template parse: rejects placeholder in URL host; rejects
-  placeholder outside a JSON string in a `bodyTemplate` with
-  normalized `application/json`; parses the final body as JSON and
-  rejects on parse failure.
-- Media type normalization: `application/json; charset=utf-8`
-  selects structural substitution; `application/json` does;
-  `text/plain; charset=utf-8` selects raw.
-- Header validation: CR / LF / NUL in rendered value rejected;
-  duplicate header names rejected; reserved names rejected.
-- URL template: `encodeURIComponent` on path/query/fragment
-  values; secrets URL-encoded like any other.
-- IP literal normalization: `127.1`, `0x7f.0.0.1`,
-  `[::ffff:127.0.0.1]` all map to loopback and are rejected.
-- Multi-A/AAAA: mixed public + private rejected.
-- Connection pinning: resolver returns multiple IPs, the client
-  connects to the one validated by the service; TLS hostname
-  verification stays on the subscription hostname.
-- Proxy env ignored unless `WEBHOOK_EXPLICIT_PROXY` is set.
-- Redirect: 302 is a delivery error, no follow.
-- Secret encrypt/decrypt roundtrip with AEAD on a correct aad;
-  wrong aad fails.
-- Key version migration: a row at v1 stays decryptable after a v2
-  is minted; new writes use v2.
-- Redaction: placeholder-first rendering never substitutes the
-  real value into diagnostic output.
-- No `lastFour`: a 3-char secret has no exposed metadata beyond
-  name + rotation timestamp.
-- Binding drift: changing header template invalidates binding;
-  delivery refuses attempt.
-- Revision guard: a job at revision N is refused when the
-  subscription is at revision N+1.
-- Event-type in dedup key: `IssueUpdated` and `IssueStatusChange`
-  on the same Tx produce two outbox jobs.
-- Signing: per-sub key is used; HMAC covers rendered body +
-  timestamp + deliveryId; signing-key rotation grace period emits
-  two signatures.
-- Replay horizon: a receiver can reject by timestamp.
-- previousStatus: captured at publish time; outbox row carries
-  it; a missing capture yields `null` and `templateWarnings`.
-- Owner demotion: delivery refused mid-queue, audit row written.
-- Audit read gating: a non-Owner read is refused; an Owner read
-  that lost source access on a specific issue filters that row.
-- Cleanup worker: `TxCreateDoc` and `TxUpdateDoc` bodies for
-  rolled-off rows are also pruned.
+- Permission middleware: non-Owner Tx creating / mutating a
+  subscription is refused BEFORE storage write; compound Tx is
+  walked recursively.
+- Stored-owner-only destination change: Owner B's attempt to
+  change A's subscription destination is refused with
+  `ownerIneligible`.
+- AEAD: AAD reconstructed from authenticated context; a row
+  copied into another workspace fails decrypt.
+- Master-key succession: rotation ring reads old + new rows
+  simultaneously; retiring a key makes its rows unreadable.
+- Journal realization: pre-image captured in-pipeline; crash
+  before realize leaves a `pending` journal entry; sweeper
+  realizes idempotently.
+- Payload immutability: a retry uses the same bodyBytes as the
+  first attempt; signature changes, body does not.
+- Subscription-wide lease: two sweepers racing one subscription
+  take exclusive leases; a newer job cannot overtake an older
+  retry-pending job.
+- Backlog quotas trip auto-pause and write a `backlogFull` audit
+  denial.
+- Signature grammar: repeated-header form and combined-header form
+  parse to the same list; receiver sample code validates both; test
+  vectors.
+- SSRF: all private ranges on IPv4 + IPv6; IPv4-literal normalization;
+  mixed public + private rejected; connection pinning; proxy CONNECT
+  targets the validated IP; proxy host validated at start.
+- Audit read gating: a reader without source access gets the
+  redacted row shape.
+- Test event body-disclosure: default returns no body; opt-in
+  triggers explicit confirmation audit event.
+- Cleanup task durability: TxRemoveDoc succeeds + history prune
+  fails → task row retained; next sweep completes it.
+- Apprise optional Authorization: absent `apprise_bearer` drops the
+  header before validation; present value renders normally.
 
 Integration:
 
 - Full round-trip against a local HTTP sink: subscribe, trigger a
-  Tx, assert signed body with per-sub key, assert `renderedBody`
-  stored only when `storeResponseBody` is set.
-- Outbox durability: kill the service between apply and publish;
-  on restart, the outbox has the row and delivery runs.
-- At-least-once with receiver dedup: force a worker crash between
-  2xx and job state write; the retry fires; the receiver (holding
-  `X-Huly-Delivery`) rejects the duplicate.
-- Cross-workspace restore: an encrypted secret from workspace A
-  copied into workspace B fails AEAD auth; the subscription
-  auto-pauses with `secretsUnreadable`.
-- Rate limit: 31st delivery in 60s queues; 10 saturated windows
-  pause the sub.
-- Preview access gating: a non-Owner request is refused; an Owner
-  without source access on the chosen issue is refused.
+  Tx, assert signed body, assert audit blob encrypted with AEAD,
+  assert attempt row carries identifiers.
+- Restore handling: a same-workspace backup restored sets the
+  guard flag; subscriptions behave as disabled until Owner
+  reactivates each.
+- Kafka ack ordering: a stalled HTTP receiver on sub A does not
+  stall deliveries for sub B in another partition group.
+- Cross-workspace copy of a secret row fails to decrypt in the
+  destination workspace; subscription auto-pauses with
+  `secretsUnreadable`.
+- Owner demotion mid-queue: outbox job is refused on the next
+  attempt with `ownerDemoted`; audit row written.
 
-## Scope exclusions and follow-ups
+## Open questions for review
 
-- **Doc and Membership events.** The subscription model carries them;
-  the delivery service grows a Doc / Membership path once Issue is
-  proven. Each new event type adds its own variable set and audit
-  shape.
-- **Per-user personal subscriptions.** Different authorization story;
-  deferred.
-- **Multi-workspace fan-out.** Not v1.
-- **Expression language.** Not v1 (Michael pinned this). A tiny
-  grammar can be added later without breaking stored subscriptions.
-- **GUI template editor with autocomplete.** v1 ships a `<textarea>`
-  plus the variable reference drawer.
-- **TLS cert pinning per subscription.** Future extension if a
-  workspace needs it.
-- **Second-Owner authorization for destination changes.** Rev 3
-  specifies the mechanism; whether to enable it by default or make
-  it an opt-in workspace policy is deferred to the implementation
-  PR.
+None blocking. If the implementation PR surfaces any, they go
+through the usual review loop.
